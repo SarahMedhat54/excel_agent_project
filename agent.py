@@ -12,6 +12,9 @@ from mcp.client.stdio import stdio_client
 load_dotenv()
 MODEL = os.getenv("MODEL", "openai/gpt-oss-120b")
 
+# Chinese / Japanese / Korean characters: the model sometimes drifts into them
+CJK = re.compile(r"[\u1100-\u11ff\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
 SYSTEM_PROMPT = """You are an Excel assistant. With your tools you can create Excel files,
 edit them, analyze them (EDA), and add charts.
 
@@ -24,7 +27,9 @@ Rules:
 - Never invent data the user did not ask for, except sample data when they ask for it.
 - If a column the user mentions does not exist, say so instead of guessing.
 - Tool arguments must be real JSON: numbers as numbers, lists as lists (not strings).
-- When done, reply briefly in the user's language: what you did, and key findings if you ran EDA.
+- LANGUAGE: reply in the language of the user's latest message (English or Arabic).
+  If it is English, reply in English only. Never use Chinese, Japanese or Korean characters.
+- When done, reply briefly: what you did, and key findings if you ran EDA.
   Do not mention file paths or file_id: the app shows a download button by itself."""
 
 SERVER = StdioServerParameters(command=sys.executable, args=["server.py"])
@@ -34,6 +39,8 @@ async def run_agent(messages: list) -> tuple[str, list]:
     """One user turn. Returns (final_text, file_ids_touched)."""
     client = AsyncGroq()  # reads GROQ_API_KEY from .env
     file_ids: list = []
+    extra: list = []  # temporary correction messages (not saved in the history)
+    retried = False
 
     async with stdio_client(SERVER) as (read, write):
         async with ClientSession(read, write) as session:
@@ -51,19 +58,33 @@ async def run_agent(messages: list) -> tuple[str, list]:
                 for t in listed.tools
             ]
 
-            for _ in range(12):  # safety limit on tool rounds
+            for _ in range(14):  # safety limit on tool rounds
                 response = await client.chat.completions.create(
                     model=MODEL,
-                    messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages + extra,
                     tools=tools,
                     tool_choice="auto",
+                    temperature=0.2,
                     max_tokens=2000,
                 )
                 msg = response.choices[0].message
 
                 if not msg.tool_calls:
-                    messages.append({"role": "assistant", "content": msg.content or ""})
-                    return (msg.content or "").strip(), list(dict.fromkeys(file_ids))
+                    text = (msg.content or "").strip()
+                    if CJK.search(text) and not retried:
+                        # wrong language: ask for a rewrite once, without saving the bad reply
+                        retried = True
+                        extra = [
+                            {"role": "assistant", "content": text},
+                            {
+                                "role": "user",
+                                "content": "Rewrite your last reply in the same language as my last "
+                                "message (English or Arabic). Do not use Chinese, Japanese or Korean.",
+                            },
+                        ]
+                        continue
+                    messages.append({"role": "assistant", "content": text})
+                    return text, list(dict.fromkeys(file_ids))
 
                 messages.append(
                     {
